@@ -1,0 +1,84 @@
+name: Resumir
+
+# Solo por pedido (lo dispara el Worker) y por horario, como respaldo. Nunca por push ni por PR:
+# este repositorio es público y sus secretos no deben correr con código de terceros.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/5 * * * *"
+
+concurrency:
+  group: resumir
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  resumir:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BASE_URL: https://www.keepanalog.com
+    steps:
+      - name: Ver si hay pedidos
+        id: pendientes
+        env:
+          CLAVE: ${{ secrets.RESUMENES_CLAVE }}
+        run: |
+          set -euo pipefail
+          n=$(curl -fsS -H "Authorization: Bearer $CLAVE" "$BASE_URL/api/internal/ops/article-summaries" | jq '.pending | length')
+          echo "cantidad=$n" >> "$GITHUB_OUTPUT"
+          echo "pendientes: $n"
+
+      - uses: actions/checkout@v4
+        if: steps.pendientes.outputs.cantidad != '0'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        if: steps.pendientes.outputs.cantidad != '0'
+        with:
+          node-version: 22
+
+      # Codex y la librería de imágenes quedan guardados entre corridas: solo se instalan de
+      # cero cuando cambia package-lock.json.
+      - uses: actions/cache@v4
+        if: steps.pendientes.outputs.cantidad != '0'
+        id: dependencias
+        with:
+          path: node_modules
+          key: dependencias-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Instalar
+        if: steps.pendientes.outputs.cantidad != '0' && steps.dependencias.outputs.cache-hit != 'true'
+        run: npm ci --omit=dev --no-audit --no-fund
+
+      - name: Resumir
+        if: steps.pendientes.outputs.cantidad != '0'
+        env:
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
+          CRON_SECRET: ${{ secrets.RESUMENES_CLAVE }}
+          CANARY_BASE_URL: https://www.keepanalog.com
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME/.codex"
+          printf '%s' "$CODEX_AUTH" > "$HOME/.codex/auth.json"
+          sha256sum "$HOME/.codex/auth.json" | cut -d' ' -f1 > "$RUNNER_TEMP/sesion.antes"
+          PATH="$PWD/node_modules/.bin:$PATH" node resumidor.mjs
+
+      # Codex renueva su sesión cada tantos días y reescribe el archivo: si cambió, se guarda de
+      # vuelta para la próxima corrida.
+      - name: Guardar la sesión si se renovó
+        if: always() && steps.pendientes.outputs.cantidad != '0'
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+        run: |
+          set -euo pipefail
+          archivo="$HOME/.codex/auth.json"
+          if [ -s "$archivo" ] && [ "$(sha256sum "$archivo" | cut -d' ' -f1)" != "$(cat "$RUNNER_TEMP/sesion.antes" 2>/dev/null)" ]; then
+            jq -e '.tokens.refresh_token' "$archivo" > /dev/null
+            gh secret set CODEX_AUTH --repo "$GITHUB_REPOSITORY" < "$archivo"
+            echo "sesión renovada y guardada"
+          fi
+          rm -rf "$HOME/.codex"
