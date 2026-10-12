@@ -16,7 +16,10 @@ permissions: {}
 jobs:
   resumir:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # La sesión de Codex es un secreto del entorno: se lee cuando el trabajo arranca. Un secreto
+    # del repositorio se lee al encolar, y una corrida encolada usaría la sesión anterior.
+    environment: resumidor
+    timeout-minutes: 60
     env:
       BASE_URL: https://www.keepanalog.com
     steps:
@@ -30,23 +33,29 @@ jobs:
           echo "cantidad=$n" >> "$GITHUB_OUTPUT"
           echo "pendientes: $n"
 
-      # Sin el token que guarda la sesión renovada no se arranca: una sesión renovada y perdida
-      # deja al corredor sin poder entrar.
+      # Antes de usar Codex se comprueba que la sesión se puede guardar, guardando la misma que
+      # se recibió. Una sesión renovada y perdida deja al corredor sin poder entrar.
       - name: Comprobar que la sesión se puede guardar
         if: steps.pendientes.outputs.cantidad != '0'
+        timeout-minutes: 3
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
         run: |
           set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then echo "falta RUNNER_PAT"; exit 1; fi
+          printf '%s' "$CODEX_AUTH" | jq -e '[.tokens.refresh_token, .tokens.access_token, .tokens.id_token, .tokens.account_id] | all(type == "string" and length > 0)' > /dev/null || { echo "la sesión guardada no es válida"; exit 1; }
+          printf '%s' "$CODEX_AUTH" | gh secret set CODEX_AUTH --env resumidor --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 || { echo "RUNNER_PAT no puede guardar la sesión"; exit 1; }
 
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: steps.pendientes.outputs.cantidad != '0'
+        timeout-minutes: 5
         with:
           persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: steps.pendientes.outputs.cantidad != '0'
+        timeout-minutes: 5
         with:
           node-version: 22
 
@@ -55,15 +64,18 @@ jobs:
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: steps.pendientes.outputs.cantidad != '0'
         id: dependencias
+        timeout-minutes: 5
         with:
           path: node_modules
           key: dependencias-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
 
       - name: Instalar
         if: steps.pendientes.outputs.cantidad != '0' && steps.dependencias.outputs.cache-hit != 'true'
+        timeout-minutes: 5
         run: npm ci --omit=dev --no-audit --no-fund
 
-      # El comando tiene 35 minutos: quedan 10 para guardar la sesión antes del corte del trabajo.
+      # El comando tiene 35 minutos y los pasos anteriores, 18 como máximo: quedan al menos 5
+      # para guardar la sesión antes del corte del trabajo a los 60.
       # Termina en error si algún pedido falló, para que se vea en la lista de corridas.
       - name: Resumir
         if: steps.pendientes.outputs.cantidad != '0'
@@ -85,6 +97,7 @@ jobs:
       # vuelta para la próxima corrida.
       - name: Guardar la sesión si se renovó
         if: always() && steps.pendientes.outputs.cantidad != '0'
+        timeout-minutes: 5
         env:
           GH_TOKEN: ${{ secrets.RUNNER_PAT }}
         run: |
@@ -94,7 +107,7 @@ jobs:
             jq -e '[.tokens.refresh_token, .tokens.access_token, .tokens.id_token, .tokens.account_id] | all(type == "string" and length > 0)' "$archivo" > /dev/null
             [ "$(jq -r '.tokens.account_id' "$archivo" | sha256sum | cut -d' ' -f1)" = "$(cat "$RUNNER_TEMP/cuenta.antes")" ]
             for intento in 1 2 3; do
-              if gh secret set CODEX_AUTH --repo "$GITHUB_REPOSITORY" < "$archivo" > /dev/null 2>&1; then echo "sesión renovada y guardada"; guardada=1; break; fi
+              if gh secret set CODEX_AUTH --env resumidor --repo "$GITHUB_REPOSITORY" < "$archivo" > /dev/null 2>&1; then echo "sesión renovada y guardada"; guardada=1; break; fi
               sleep 5
             done
             [ "${guardada:-0}" = "1" ] || { echo "no se pudo guardar la sesión renovada"; exit 1; }
