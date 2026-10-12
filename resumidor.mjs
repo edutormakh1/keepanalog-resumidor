@@ -1,3 +1,5 @@
+process.argv.length = 2;
+
 // scripts/ops/resumenes.mts
 import { spawn } from "node:child_process";
 import { mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";

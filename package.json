@@ -1,8 +1,8 @@
 {
   "name": "keepanalog-resumidor",
   "private": true,
-  "type": "module",
   "description": "Corre el resumidor de Keep Analog cuando hay pedidos pendientes.",
+  "type": "module",
   "dependencies": {
     "@openai/codex": "0.162.1",
     "sharp": "0.35.4"

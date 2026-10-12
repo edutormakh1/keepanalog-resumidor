@@ -26,23 +26,33 @@ jobs:
           CLAVE: ${{ secrets.RESUMENES_CLAVE }}
         run: |
           set -euo pipefail
-          n=$(curl -fsS -H "Authorization: Bearer $CLAVE" "$BASE_URL/api/internal/ops/article-summaries" | jq '.pending | length')
+          n=$(printf 'Authorization: Bearer %s' "$CLAVE" | curl -fsS --max-time 30 -H @- "$BASE_URL/api/internal/ops/article-summaries" | jq '.pending | length')
           echo "cantidad=$n" >> "$GITHUB_OUTPUT"
           echo "pendientes: $n"
 
-      - uses: actions/checkout@v4
+      # Sin el token que guarda la sesión renovada no se arranca: una sesión renovada y perdida
+      # deja al corredor sin poder entrar.
+      - name: Comprobar que la sesión se puede guardar
+        if: steps.pendientes.outputs.cantidad != '0'
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then echo "falta RUNNER_PAT"; exit 1; fi
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         if: steps.pendientes.outputs.cantidad != '0'
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         if: steps.pendientes.outputs.cantidad != '0'
         with:
           node-version: 22
 
       # Codex y la librería de imágenes quedan guardados entre corridas: solo se instalan de
       # cero cuando cambia package-lock.json.
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         if: steps.pendientes.outputs.cantidad != '0'
         id: dependencias
         with:
@@ -53,6 +63,8 @@ jobs:
         if: steps.pendientes.outputs.cantidad != '0' && steps.dependencias.outputs.cache-hit != 'true'
         run: npm ci --omit=dev --no-audit --no-fund
 
+      # El comando tiene 35 minutos: quedan 10 para guardar la sesión antes del corte del trabajo.
+      # Termina en error si algún pedido falló, para que se vea en la lista de corridas.
       - name: Resumir
         if: steps.pendientes.outputs.cantidad != '0'
         env:
@@ -64,8 +76,10 @@ jobs:
           umask 077
           mkdir -p "$HOME/.codex"
           printf '%s' "$CODEX_AUTH" > "$HOME/.codex/auth.json"
+          jq -r '.tokens.account_id' "$HOME/.codex/auth.json" | sha256sum | cut -d' ' -f1 > "$RUNNER_TEMP/cuenta.antes"
           sha256sum "$HOME/.codex/auth.json" | cut -d' ' -f1 > "$RUNNER_TEMP/sesion.antes"
-          PATH="$PWD/node_modules/.bin:$PATH" node resumidor.mjs
+          PATH="$PWD/node_modules/.bin:$PATH" timeout --signal=TERM --kill-after=30 35m node resumidor.mjs | tee "$RUNNER_TEMP/salida.txt"
+          tail -n 1 "$RUNNER_TEMP/salida.txt" | jq -e '.failed == 0' > /dev/null
 
       # Codex renueva su sesión cada tantos días y reescribe el archivo: si cambió, se guarda de
       # vuelta para la próxima corrida.
@@ -77,8 +91,12 @@ jobs:
           set -euo pipefail
           archivo="$HOME/.codex/auth.json"
           if [ -s "$archivo" ] && [ "$(sha256sum "$archivo" | cut -d' ' -f1)" != "$(cat "$RUNNER_TEMP/sesion.antes" 2>/dev/null)" ]; then
-            jq -e '.tokens.refresh_token' "$archivo" > /dev/null
-            gh secret set CODEX_AUTH --repo "$GITHUB_REPOSITORY" < "$archivo"
-            echo "sesión renovada y guardada"
+            jq -e '[.tokens.refresh_token, .tokens.access_token, .tokens.id_token, .tokens.account_id] | all(type == "string" and length > 0)' "$archivo" > /dev/null
+            [ "$(jq -r '.tokens.account_id' "$archivo" | sha256sum | cut -d' ' -f1)" = "$(cat "$RUNNER_TEMP/cuenta.antes")" ]
+            for intento in 1 2 3; do
+              if gh secret set CODEX_AUTH --repo "$GITHUB_REPOSITORY" < "$archivo" > /dev/null 2>&1; then echo "sesión renovada y guardada"; guardada=1; break; fi
+              sleep 5
+            done
+            [ "${guardada:-0}" = "1" ] || { echo "no se pudo guardar la sesión renovada"; exit 1; }
           fi
           rm -rf "$HOME/.codex"
